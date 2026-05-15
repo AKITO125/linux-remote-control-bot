@@ -59,10 +59,13 @@ _alert_last_sent: dict[tuple[int, str], datetime] = {}
 _autoshoot: dict[int, asyncio.Task] = {}
 # 認証失敗記録: user_id -> [失敗時刻, ...]
 _auth_failures: dict[int, list[datetime]] = {}
+# cronジョブ: cron_id -> {"cmd", "interval", "ch_id", "task"}
+_cron_jobs: dict[int, dict] = {}
+_next_cron_id: int = 1
 
 # ── 永続設定 ─────────────────────────────────────────────────────────────────
 CONFIG_PATH = Path("config.json")
-_cfg: dict = {"alerts": {}, "autowatch": {}, "autoshot": {}, "blocked": []}
+_cfg: dict = {"alerts": {}, "autowatch": {}, "autoshot": {}, "blocked": [], "startup": [], "cron": []}
 
 
 def _cfg_load() -> None:
@@ -295,6 +298,36 @@ def _start_autoshot_task(channel: discord.abc.Messageable, interval: int) -> Non
     _autoshoot[ch_id] = task
 
 
+def _start_cron_task(
+    channel: discord.abc.Messageable,
+    cron_id: int,
+    cmd: str,
+    interval: int,
+    run_now: bool = False,
+) -> None:
+    """cronジョブタスクを開始して _cron_jobs に登録する。"""
+    async def _loop():
+        try:
+            if not run_now:
+                await asyncio.sleep(interval)
+            while True:
+                out = await run_shell(cmd)
+                ts = datetime.now().strftime("%H:%M:%S")
+                await channel.send(f"`{ts}` ⏰ **cron #{cron_id}** — `{cmd}`")
+                if out:
+                    await send_text(channel, out)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if cron_id in _cron_jobs:
+                _cron_jobs[cron_id]["task"] = None
+
+    task = asyncio.create_task(_loop())
+    if cron_id in _cron_jobs:
+        _cron_jobs[cron_id]["task"] = task
+
+
 # ── イベント ─────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -351,9 +384,40 @@ async def _alert_monitor_loop():
 
 
 async def _restore_persistent() -> None:
-    """Bot起動時に永続設定（autowatch / autoshot）を復元する。"""
+    """Bot起動時に永続設定（startup / cron / autowatch / autoshot）を復元する。"""
+    global _next_cron_id
     await asyncio.sleep(3)  # チャンネルキャッシュが揃うのを待つ
 
+    # 起動時コマンドを実行
+    for entry in _cfg.get("startup", []):
+        channel = bot.get_channel(int(entry["ch"]))
+        if not channel:
+            continue
+        cmd = entry["cmd"]
+        out = await run_shell(cmd)
+        ts = datetime.now().strftime("%H:%M:%S")
+        await channel.send(f"`{ts}` 🚀 **startup** — `{cmd}`")
+        if out:
+            await send_text(channel, out)
+
+    # cronジョブを再開
+    cron_ids = [e["id"] for e in _cfg.get("cron", [])]
+    _next_cron_id = max(cron_ids, default=0) + 1
+    for entry in _cfg.get("cron", []):
+        cron_id = entry["id"]
+        channel = bot.get_channel(int(entry["ch"]))
+        if not channel:
+            continue
+        _cron_jobs[cron_id] = {
+            "cmd": entry["cmd"], "interval": entry["interval"],
+            "ch_id": int(entry["ch"]), "task": None,
+        }
+        _start_cron_task(channel, cron_id, entry["cmd"], entry["interval"], run_now=True)
+        await channel.send(
+            f"🔄 **cron #{cron_id}** を再開 — `{entry['cmd']}` / {entry['interval']}秒ごと"
+        )
+
+    # 自動ログ監視を再開
     for ch_id_str, paths in _cfg.get("autowatch", {}).items():
         ch_id = int(ch_id_str)
         channel = bot.get_channel(ch_id)
@@ -369,6 +433,7 @@ async def _restore_persistent() -> None:
             _start_watch_task(channel, target, key)
             await channel.send(f"🔄 自動ログ監視を再開: `{path_str}`")
 
+    # 自動スクリーンショットを再開
     for ch_id_str, interval in _cfg.get("autoshot", {}).items():
         ch_id = int(ch_id_str)
         channel = bot.get_channel(ch_id)
@@ -1860,6 +1925,211 @@ async def slash_log(interaction: discord.Interaction, path: str, lines: int = 50
 
 
 # ════════════════════════════════════════════════════════════
+#  起動時コマンド・定期実行 (cron)
+# ════════════════════════════════════════════════════════════
+
+@bot.command(name="startup")
+async def cmd_startup(ctx: commands.Context, action: str = "list", *, rest: str = ""):
+    """
+    Bot起動時に自動実行するコマンドを管理。
+      !startup list           → 一覧
+      !startup add <cmd>      → 追加
+      !startup remove <番号>  → 削除
+      !startup run            → 今すぐ全て手動実行
+    """
+    if not is_authorized(ctx):
+        await ctx.send("権限がありません。")
+        return
+
+    entries: list = _cfg.setdefault("startup", [])
+
+    if action == "list":
+        if not entries:
+            await ctx.send("起動時コマンドは設定されていません。`!startup add <cmd>` で追加できます。")
+            return
+        lines = []
+        for i, e in enumerate(entries, 1):
+            ch = bot.get_channel(int(e["ch"]))
+            ch_name = f"#{ch.name}" if ch else f"ch:{e['ch']}"
+            lines.append(f"`{i}` [{ch_name}] `{e['cmd']}`")
+        await ctx.send("起動時コマンド:\n" + "\n".join(lines))
+
+    elif action == "add":
+        if not rest:
+            await ctx.send("コマンドを指定してください。例: `!startup add df -h`")
+            return
+        if (blocked := is_blocked(rest)):
+            await ctx.send(f"ブロックされたコマンド: `{blocked}`")
+            return
+        entries.append({"ch": str(ctx.channel.id), "cmd": rest})
+        _cfg_save()
+        await ctx.send(f"起動時コマンドに追加しました (#{len(entries)}): `{rest}`")
+
+    elif action == "remove":
+        if not rest:
+            await ctx.send("番号を指定してください。例: `!startup remove 1`")
+            return
+        try:
+            idx = int(rest) - 1
+        except ValueError:
+            await ctx.send("番号は整数で指定してください。")
+            return
+        if idx < 0 or idx >= len(entries):
+            await ctx.send(f"番号が範囲外です（1〜{len(entries)}）。")
+            return
+        removed = entries.pop(idx)
+        _cfg_save()
+        await ctx.send(f"削除しました: `{removed['cmd']}`")
+
+    elif action == "run":
+        if not entries:
+            await ctx.send("起動時コマンドは設定されていません。")
+            return
+        await ctx.send(f"起動時コマンドを手動実行します（{len(entries)}件）...")
+        for e in entries:
+            out = await run_shell(e["cmd"])
+            ts = datetime.now().strftime("%H:%M:%S")
+            await ctx.send(f"`{ts}` 🚀 `{e['cmd']}`")
+            if out:
+                await send_text(ctx.channel, out)
+
+    else:
+        await ctx.send("`!startup list / add <cmd> / remove <番号> / run` の形式で指定してください。")
+
+
+@bot.command(name="cron")
+async def cmd_cron(ctx: commands.Context, action: str = "list", *, rest: str = ""):
+    """
+    定期実行コマンドを管理（設定は再起動後も復元）。
+      !cron list              → 一覧（▶=実行中 ⏹=停止中）
+      !cron add <秒> <cmd>    → N秒ごとに結果をこのチャンネルに送信
+      !cron stop <id>         → 一時停止（設定は保持）
+      !cron start <id>        → 一時停止中のジョブを再開
+      !cron remove <id>       → 削除（設定も削除）
+    """
+    global _next_cron_id
+    if not is_authorized(ctx):
+        await ctx.send("権限がありません。")
+        return
+
+    cron_entries: list = _cfg.setdefault("cron", [])
+
+    if action == "list":
+        if not cron_entries:
+            await ctx.send(
+                "cronジョブは設定されていません。\n"
+                "`!cron add <秒> <コマンド>` で追加できます。例: `!cron add 300 df -h`"
+            )
+            return
+        lines = []
+        for e in cron_entries:
+            cid = e["id"]
+            ch = bot.get_channel(int(e["ch"]))
+            ch_name = f"#{ch.name}" if ch else f"ch:{e['ch']}"
+            job = _cron_jobs.get(cid, {})
+            t = job.get("task")
+            status = "▶" if t and not t.done() else "⏹"
+            lines.append(f"`#{cid}` {status} [{e['interval']}秒ごと] `{e['cmd']}` ({ch_name})")
+        await ctx.send("cronジョブ (▶=実行中 ⏹=停止中):\n" + "\n".join(lines))
+
+    elif action == "add":
+        parts = rest.split(None, 1)
+        if len(parts) < 2:
+            await ctx.send("使い方: `!cron add <秒> <コマンド>`\n例: `!cron add 300 df -h`")
+            return
+        try:
+            interval = int(parts[0])
+        except ValueError:
+            await ctx.send("秒数は整数で指定してください。")
+            return
+        if interval < 10:
+            await ctx.send("間隔は10秒以上にしてください。")
+            return
+        cmd = parts[1]
+        if (blocked := is_blocked(cmd)):
+            await ctx.send(f"ブロックされたコマンド: `{blocked}`")
+            return
+        cron_id = _next_cron_id
+        _next_cron_id += 1
+        cron_entries.append({"id": cron_id, "ch": str(ctx.channel.id), "cmd": cmd, "interval": interval})
+        _cfg_save()
+        _cron_jobs[cron_id] = {"cmd": cmd, "interval": interval, "ch_id": ctx.channel.id, "task": None}
+        _start_cron_task(ctx.channel, cron_id, cmd, interval, run_now=False)
+        await ctx.send(
+            f"cronジョブ **#{cron_id}** を追加しました。\n"
+            f"`{cmd}` を **{interval}秒**ごとに実行します。"
+        )
+
+    elif action == "stop":
+        try:
+            cron_id = int(rest)
+        except ValueError:
+            await ctx.send("IDは整数で指定してください。例: `!cron stop 1`")
+            return
+        job = _cron_jobs.get(cron_id)
+        if not job:
+            await ctx.send(f"cronジョブ #{cron_id} が見つかりません。`!cron list` で確認してください。")
+            return
+        t = job.get("task")
+        if t and not t.done():
+            t.cancel()
+            await ctx.send(f"cronジョブ **#{cron_id}** を一時停止しました。再開: `!cron start {cron_id}`")
+        else:
+            await ctx.send(f"cronジョブ **#{cron_id}** は既に停止中です。")
+
+    elif action == "start":
+        try:
+            cron_id = int(rest)
+        except ValueError:
+            await ctx.send("IDは整数で指定してください。例: `!cron start 1`")
+            return
+        entry = next((e for e in cron_entries if e["id"] == cron_id), None)
+        if not entry:
+            await ctx.send(f"cronジョブ #{cron_id} が見つかりません。`!cron list` で確認してください。")
+            return
+        job = _cron_jobs.get(cron_id, {})
+        t = job.get("task")
+        if t and not t.done():
+            await ctx.send(f"cronジョブ **#{cron_id}** は既に実行中です。")
+            return
+        channel = bot.get_channel(int(entry["ch"]))
+        if not channel:
+            await ctx.send(f"チャンネルが見つかりません（ch:{entry['ch']}）。")
+            return
+        if cron_id not in _cron_jobs:
+            _cron_jobs[cron_id] = {
+                "cmd": entry["cmd"], "interval": entry["interval"],
+                "ch_id": int(entry["ch"]), "task": None,
+            }
+        _start_cron_task(channel, cron_id, entry["cmd"], entry["interval"], run_now=True)
+        await ctx.send(f"cronジョブ **#{cron_id}** を再開しました。")
+
+    elif action == "remove":
+        try:
+            cron_id = int(rest)
+        except ValueError:
+            await ctx.send("IDは整数で指定してください。例: `!cron remove 1`")
+            return
+        entry = next((e for e in cron_entries if e["id"] == cron_id), None)
+        if not entry:
+            await ctx.send(f"cronジョブ #{cron_id} が見つかりません。`!cron list` で確認してください。")
+            return
+        cron_entries.remove(entry)
+        _cfg_save()
+        job = _cron_jobs.pop(cron_id, None)
+        if job:
+            t = job.get("task")
+            if t and not t.done():
+                t.cancel()
+        await ctx.send(f"cronジョブ **#{cron_id}** を削除しました。")
+
+    else:
+        await ctx.send(
+            "`!cron list / add <秒> <cmd> / stop <id> / start <id> / remove <id>` の形式で指定してください。"
+        )
+
+
+# ════════════════════════════════════════════════════════════
 #  永続設定・メタ
 # ════════════════════════════════════════════════════════════
 
@@ -1874,6 +2144,34 @@ async def cmd_settings(ctx: commands.Context):
         title="永続設定一覧",
         description=f"保存先: `{CONFIG_PATH.resolve()}`",
         color=discord.Color.purple(),
+    )
+
+    # 起動時コマンド
+    startup_lines = []
+    for e in _cfg.get("startup", []):
+        ch = bot.get_channel(int(e["ch"]))
+        ch_name = f"#{ch.name}" if ch else f"ch:{e['ch']}"
+        startup_lines.append(f"`{e['cmd']}` ({ch_name})")
+    embed.add_field(
+        name="起動時コマンド (`!startup add/remove/run`)",
+        value="\n".join(startup_lines) or "(なし)",
+        inline=False,
+    )
+
+    # cronジョブ
+    cron_lines = []
+    for e in _cfg.get("cron", []):
+        cid = e["id"]
+        ch = bot.get_channel(int(e["ch"]))
+        ch_name = f"#{ch.name}" if ch else f"ch:{e['ch']}"
+        job = _cron_jobs.get(cid, {})
+        t = job.get("task")
+        status = "▶" if t and not t.done() else "⏹"
+        cron_lines.append(f"`#{cid}` {status} [{e['interval']}秒] `{e['cmd']}` ({ch_name})")
+    embed.add_field(
+        name="cronジョブ (`!cron add/stop/start/remove`) — 起動時に自動再開",
+        value="\n".join(cron_lines) or "(なし)",
+        inline=False,
     )
 
     # アラート
@@ -2015,11 +2313,13 @@ async def cmd_help(ctx: commands.Context):
             ("!type <テキスト>",     "テキスト入力（xdotool）"),
             ("!key <キー>",          "キー送信（例: ctrl+c, Return）"),
         ]),
-        ("永続設定", [
-            ("!settings",                       "全永続設定を一覧表示（再起動後も保持）"),
-            ("!block list/add/remove <cmd>",    "ブロックコマンドを動的管理"),
+        ("永続設定・自動化", [
+            ("!settings",                        "全永続設定を一覧表示（再起動後も保持）"),
+            ("!startup add/remove/list/run",     "起動時に自動実行するコマンドを管理"),
+            ("!cron add <秒> <cmd>",             "任意コマンドをN秒ごとに定期実行"),
+            ("!cron list/stop/start/remove",     "cronジョブの管理（再起動後も復元）"),
+            ("!block list/add/remove <cmd>",     "ブロックコマンドを動的管理"),
             ("!autowatch list/add/remove <path>","ログ自動監視を管理（起動時に復元）"),
-            ("!autoshot [秒] / !stopauto",       "自動スクショ（設定は再起動後も復元）"),
             ("!alert / !unalert",                "アラート（設定は再起動後も復元）"),
         ]),
         ("スラッシュコマンド", [
