@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import json
 import os
 import shutil
 from datetime import datetime, timedelta
@@ -59,6 +60,30 @@ _autoshoot: dict[int, asyncio.Task] = {}
 # 認証失敗記録: user_id -> [失敗時刻, ...]
 _auth_failures: dict[int, list[datetime]] = {}
 
+# ── 永続設定 ─────────────────────────────────────────────────────────────────
+CONFIG_PATH = Path("config.json")
+_cfg: dict = {"alerts": {}, "autowatch": {}, "autoshot": {}, "blocked": []}
+
+
+def _cfg_load() -> None:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            for k, v in data.items():
+                _cfg[k] = v
+        except Exception as e:
+            print(f"[config] 読み込みエラー: {e}")
+
+
+def _cfg_save() -> None:
+    try:
+        CONFIG_PATH.write_text(
+            json.dumps(_cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"[config] 保存エラー: {e}")
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -97,7 +122,7 @@ async def send_text(channel: discord.abc.Messageable, text: str) -> None:
 
 
 def is_blocked(cmd: str) -> str | None:
-    for b in BLOCKED_CMDS:
+    for b in BLOCKED_CMDS + _cfg.get("blocked", []):
         if cmd.strip().startswith(b):
             return b
     return None
@@ -210,12 +235,77 @@ async def sudo_run(cmd: str, timeout: int = COMMAND_TIMEOUT) -> str:
     return await run_shell(full, timeout=timeout)
 
 
+def _start_watch_task(channel: discord.abc.Messageable, target: Path, key: tuple) -> None:
+    """ログファイルの tail タスクを開始して _watchers に登録する。"""
+    init_pos = target.stat().st_size if target.exists() else 0
+
+    async def _tail():
+        pos = init_pos
+        pending = ""
+        try:
+            while True:
+                await asyncio.sleep(2)
+                try:
+                    size = target.stat().st_size
+                except FileNotFoundError:
+                    await channel.send(f"`{target}` が削除されました。監視停止。")
+                    break
+                if size < pos:
+                    pos = 0
+                if size > pos:
+                    with open(target, "rb") as f:
+                        f.seek(pos)
+                        chunk = f.read(size - pos)
+                    pos = size
+                    pending += chunk.decode("utf-8", errors="replace")
+                if "\n" in pending or len(pending) > 800:
+                    text = pending.strip()
+                    pending = ""
+                    if text:
+                        await send_text(channel, text)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _watchers.pop(key, None)
+
+    task = asyncio.create_task(_tail())
+    _watchers[key] = {"path": target, "task": task}
+
+
+def _start_autoshot_task(channel: discord.abc.Messageable, interval: int) -> None:
+    """自動スクリーンショットタスクを開始して _autoshoot に登録する。"""
+    ch_id = channel.id
+
+    async def _loop():
+        try:
+            while True:
+                ok, _ = await _take_screenshot()
+                if ok:
+                    await channel.send(
+                        f"`{datetime.now().strftime('%H:%M:%S')}` — 自動送信",
+                        file=discord.File(SCREENSHOT_PATH, filename="screenshot.png"),
+                    )
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _autoshoot.pop(ch_id, None)
+
+    task = asyncio.create_task(_loop())
+    _autoshoot[ch_id] = task
+
+
 # ── イベント ─────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
+    _cfg_load()
+    # config からアラートを復元
+    for ch_id_str, thresholds in _cfg.get("alerts", {}).items():
+        _alerts[int(ch_id_str)] = thresholds
     print(f"起動: {bot.user}  作業Dir: {WORK_DIR}")
     asyncio.create_task(_alert_monitor_loop())
+    asyncio.create_task(_restore_persistent())
 
 
 @bot.event
@@ -258,6 +348,34 @@ async def _alert_monitor_loop():
                     _alert_last_sent[key] = now
         except Exception as e:
             print(f"[alert] {e}")
+
+
+async def _restore_persistent() -> None:
+    """Bot起動時に永続設定（autowatch / autoshot）を復元する。"""
+    await asyncio.sleep(3)  # チャンネルキャッシュが揃うのを待つ
+
+    for ch_id_str, paths in _cfg.get("autowatch", {}).items():
+        ch_id = int(ch_id_str)
+        channel = bot.get_channel(ch_id)
+        if not channel:
+            continue
+        for path_str in list(paths):
+            target = Path(path_str)
+            if not target.is_file():
+                continue
+            key = (ch_id, path_str)
+            if key in _watchers:
+                continue
+            _start_watch_task(channel, target, key)
+            await channel.send(f"🔄 自動ログ監視を再開: `{path_str}`")
+
+    for ch_id_str, interval in _cfg.get("autoshot", {}).items():
+        ch_id = int(ch_id_str)
+        channel = bot.get_channel(ch_id)
+        if not channel or ch_id in _autoshoot:
+            continue
+        _start_autoshot_task(channel, interval)
+        await channel.send(f"🔄 自動スクリーンショットを再開（{interval}秒ごと）")
 
 
 # ════════════════════════════════════════════════════════════
@@ -621,6 +739,59 @@ async def cmd_grep(ctx: commands.Context, pattern: str, path: str = "."):
     target = (WORK_DIR / path).resolve()
     out = await run_shell(f"grep -rn '{pattern}' {target} 2>/dev/null | head -30", timeout=15)
     await send_text(ctx.channel, out or "マッチなし。")
+
+
+# ════════════════════════════════════════════════════════════
+#  動的コマンドブロック管理
+# ════════════════════════════════════════════════════════════
+
+@bot.command(name="block")
+async def cmd_block(ctx: commands.Context, action: str, *, cmd: str = ""):
+    """
+    ブロックするコマンドを動的に管理。
+      !block list            → 現在のブロックリスト（.env + 動的追加）
+      !block add <cmd>       → コマンドをブロックに追加
+      !block remove <cmd>    → コマンドをブロックから削除
+    """
+    if not is_authorized(ctx):
+        await ctx.send("権限がありません。")
+        return
+
+    dynamic: list = _cfg.setdefault("blocked", [])
+
+    if action == "list":
+        env_part = "\n".join(f"  `{b}`" for b in BLOCKED_CMDS) or "  (なし)"
+        dyn_part = "\n".join(f"  `{b}`" for b in dynamic) or "  (なし)"
+        await ctx.send(
+            f"**ブロックリスト**\n"
+            f"`.env` 設定:\n{env_part}\n"
+            f"動的追加 (`!block add`):\n{dyn_part}"
+        )
+
+    elif action == "add":
+        if not cmd:
+            await ctx.send("ブロックするコマンドを指定してください。例: `!block add curl evil.com`")
+            return
+        if cmd in dynamic:
+            await ctx.send(f"既にブロック済み: `{cmd}`")
+            return
+        dynamic.append(cmd)
+        _cfg_save()
+        await ctx.send(f"ブロックリストに追加しました: `{cmd}`")
+
+    elif action == "remove":
+        if not cmd:
+            await ctx.send("削除するコマンドを指定してください。")
+            return
+        if cmd not in dynamic:
+            await ctx.send(f"`{cmd}` はブロックリストにありません。`!block list` で確認してください。")
+            return
+        dynamic.remove(cmd)
+        _cfg_save()
+        await ctx.send(f"ブロックリストから削除しました: `{cmd}`")
+
+    else:
+        await ctx.send("`!block list / add <cmd> / remove <cmd>` の形式で指定してください。")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1061,39 +1232,7 @@ async def cmd_watch(ctx: commands.Context, path: str):
         await ctx.send(f"`{target}` は既に監視中です。")
         return
 
-    init_pos = target.stat().st_size
-
-    async def _tail():
-        pos = init_pos
-        pending = ""
-        try:
-            while True:
-                await asyncio.sleep(2)
-                try:
-                    size = target.stat().st_size
-                except FileNotFoundError:
-                    await ctx.channel.send(f"`{target}` が削除されました。監視停止。")
-                    break
-                if size < pos:
-                    pos = 0
-                if size > pos:
-                    with open(target, "rb") as f:
-                        f.seek(pos)
-                        chunk = f.read(size - pos)
-                    pos = size
-                    pending += chunk.decode("utf-8", errors="replace")
-                if "\n" in pending or len(pending) > 800:
-                    text = pending.strip()
-                    pending = ""
-                    if text:
-                        await send_text(ctx.channel, text)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            _watchers.pop(key, None)
-
-    task = asyncio.create_task(_tail())
-    _watchers[key] = {"path": target, "task": task}
+    _start_watch_task(ctx.channel, target, key)
     await ctx.send(f"`{target}` の監視を開始。停止: `!unwatch {path}`")
 
 
@@ -1120,6 +1259,78 @@ async def cmd_watches(ctx: commands.Context):
         return
     active = [str(v["path"]) for (cid, _), v in _watchers.items() if cid == ctx.channel.id]
     await ctx.send(("監視中:\n" + "\n".join(f"`{p}`" for p in active)) if active else "監視中のファイルはありません。")
+
+
+@bot.command(name="autowatch")
+async def cmd_autowatch(ctx: commands.Context, action: str = "list", *, path: str = ""):
+    """
+    Bot起動時に自動で再開するログ監視を管理。
+      !autowatch list           → 設定済み一覧
+      !autowatch add <パス>     → 追加（このチャンネルで起動時に自動監視）
+      !autowatch remove <パス>  → 削除
+    """
+    if not is_authorized(ctx):
+        await ctx.send("権限がありません。")
+        return
+
+    ch_str = str(ctx.channel.id)
+
+    if action == "list":
+        lines = []
+        for cid_str, paths in _cfg.get("autowatch", {}).items():
+            ch = bot.get_channel(int(cid_str))
+            ch_name = f"#{ch.name}" if ch else f"channel:{cid_str}"
+            for p in paths:
+                running = "▶" if (int(cid_str), p) in _watchers else "⏹"
+                lines.append(f"{running} `{p}` ({ch_name})")
+        await ctx.send(
+            ("自動監視リスト (▶=監視中 ⏹=停止中):\n" + "\n".join(lines))
+            if lines else "自動監視の設定はありません。`!autowatch add <パス>` で追加できます。"
+        )
+
+    elif action == "add":
+        if not path:
+            await ctx.send("パスを指定してください。例: `!autowatch add /var/log/syslog`")
+            return
+        target = Path(path).expanduser()
+        if not target.is_file():
+            await ctx.send(f"ファイルが見つかりません: `{target}`")
+            return
+        path_str = str(target)
+        ch_watches: list = _cfg.setdefault("autowatch", {}).setdefault(ch_str, [])
+        if path_str in ch_watches:
+            await ctx.send(f"既に登録済み: `{path_str}`")
+            return
+        ch_watches.append(path_str)
+        _cfg_save()
+        # 今すぐ監視も開始
+        key = (ctx.channel.id, path_str)
+        if key not in _watchers:
+            _start_watch_task(ctx.channel, target, key)
+        await ctx.send(f"自動監視に追加し、監視を開始しました: `{path_str}`")
+
+    elif action == "remove":
+        if not path:
+            await ctx.send("パスを指定してください。")
+            return
+        path_str = str(Path(path).expanduser())
+        ch_watches = _cfg.get("autowatch", {}).get(ch_str, [])
+        if path_str not in ch_watches:
+            await ctx.send(f"`{path_str}` は登録されていません。`!autowatch list` で確認してください。")
+            return
+        ch_watches.remove(path_str)
+        if not ch_watches:
+            _cfg.get("autowatch", {}).pop(ch_str, None)
+        _cfg_save()
+        # 今の監視も停止
+        key = (ctx.channel.id, path_str)
+        info = _watchers.pop(key, None)
+        if info:
+            info["task"].cancel()
+        await ctx.send(f"自動監視から削除し、監視を停止しました: `{path_str}`")
+
+    else:
+        await ctx.send("`!autowatch list / add <パス> / remove <パス>` の形式で指定してください。")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1194,6 +1405,8 @@ async def cmd_alert(ctx: commands.Context, metric: str, threshold: int):
         await ctx.send("metric は `cpu` / `mem` / `disk` のいずれか。")
         return
     _alerts.setdefault(ctx.channel.id, {})[metric] = threshold
+    _cfg.setdefault("alerts", {})[str(ctx.channel.id)] = _alerts[ctx.channel.id]
+    _cfg_save()
     label = {"cpu": "CPU", "mem": "メモリ", "disk": "ディスク"}[metric]
     await ctx.send(f"{label}使用率が **{threshold}%** を超えたらここに通知します。")
 
@@ -1224,6 +1437,10 @@ async def cmd_unalert(ctx: commands.Context, metric: str):
     _alerts.get(ctx.channel.id, {}).pop(metric, None)
     if not _alerts.get(ctx.channel.id):
         _alerts.pop(ctx.channel.id, None)
+        _cfg.get("alerts", {}).pop(str(ctx.channel.id), None)
+    else:
+        _cfg.setdefault("alerts", {})[str(ctx.channel.id)] = _alerts[ctx.channel.id]
+    _cfg_save()
     label = {"cpu": "CPU", "mem": "メモリ", "disk": "ディスク"}[metric]
     await ctx.send(f"{label}のアラートを解除しました。")
 
@@ -1337,23 +1554,9 @@ async def cmd_autoshot(ctx: commands.Context, interval: int = 30):
         await ctx.send("既に自動送信中です。`!stopauto` で停止してください。")
         return
 
-    async def _loop():
-        try:
-            while True:
-                ok, desc = await _take_screenshot()
-                if ok:
-                    await ctx.channel.send(
-                        f"`{datetime.now().strftime('%H:%M:%S')}` — 自動送信",
-                        file=discord.File(SCREENSHOT_PATH, filename="screenshot.png"),
-                    )
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            _autoshoot.pop(ctx.channel.id, None)
-
-    task = asyncio.create_task(_loop())
-    _autoshoot[ctx.channel.id] = task
+    _start_autoshot_task(ctx.channel, interval)
+    _cfg.setdefault("autoshot", {})[str(ctx.channel.id)] = interval
+    _cfg_save()
     await ctx.send(f"自動スクリーンショット開始（{interval}秒ごと）。停止: `!stopauto`")
 
 
@@ -1368,6 +1571,8 @@ async def cmd_stopauto(ctx: commands.Context):
         await ctx.send("自動送信は起動していません。")
         return
     task.cancel()
+    _cfg.get("autoshot", {}).pop(str(ctx.channel.id), None)
+    _cfg_save()
     await ctx.send("自動スクリーンショットを停止しました。")
 
 
@@ -1655,8 +1860,73 @@ async def slash_log(interaction: discord.Interaction, path: str, lines: int = 50
 
 
 # ════════════════════════════════════════════════════════════
-#  メタ
+#  永続設定・メタ
 # ════════════════════════════════════════════════════════════
+
+@bot.command(name="settings", aliases=["config"])
+async def cmd_settings(ctx: commands.Context):
+    """永続設定の一覧を表示（再起動後も保持される設定）。"""
+    if not is_authorized(ctx):
+        await ctx.send("権限がありません。")
+        return
+
+    embed = discord.Embed(
+        title="永続設定一覧",
+        description=f"保存先: `{CONFIG_PATH.resolve()}`",
+        color=discord.Color.purple(),
+    )
+
+    # アラート
+    alert_lines = []
+    for ch_id_str, thresholds in _cfg.get("alerts", {}).items():
+        ch = bot.get_channel(int(ch_id_str))
+        ch_name = f"#{ch.name}" if ch else f"ch:{ch_id_str}"
+        parts = " / ".join(f"{k.upper()}>{v}%" for k, v in thresholds.items())
+        alert_lines.append(f"{ch_name}: {parts}")
+    embed.add_field(
+        name="アラート (`!alert` / `!unalert`)",
+        value="\n".join(alert_lines) or "(なし)",
+        inline=False,
+    )
+
+    # 自動ログ監視
+    watch_lines = []
+    for cid_str, paths in _cfg.get("autowatch", {}).items():
+        ch = bot.get_channel(int(cid_str))
+        ch_name = f"#{ch.name}" if ch else f"ch:{cid_str}"
+        for p in paths:
+            running = "▶" if (int(cid_str), p) in _watchers else "⏹"
+            watch_lines.append(f"{running} `{p}` ({ch_name})")
+    embed.add_field(
+        name="自動ログ監視 (`!autowatch`) — 起動時に自動再開",
+        value="\n".join(watch_lines) or "(なし)",
+        inline=False,
+    )
+
+    # 自動スクリーンショット
+    shot_lines = []
+    for cid_str, interval in _cfg.get("autoshot", {}).items():
+        ch = bot.get_channel(int(cid_str))
+        ch_name = f"#{ch.name}" if ch else f"ch:{cid_str}"
+        running = "▶" if int(cid_str) in _autoshoot else "⏹"
+        shot_lines.append(f"{running} {ch_name}: {interval}秒ごと")
+    embed.add_field(
+        name="自動スクリーンショット (`!autoshot`) — 起動時に自動再開",
+        value="\n".join(shot_lines) or "(なし)",
+        inline=False,
+    )
+
+    # 動的ブロックコマンド
+    dynamic_blocked = _cfg.get("blocked", [])
+    embed.add_field(
+        name="動的ブロックコマンド (`!block add/remove`)",
+        value=("\n".join(f"`{b}`" for b in dynamic_blocked) or "(なし)"),
+        inline=False,
+    )
+
+    embed.set_footer(text="▶=現在動作中  ⏹=設定のみ（次回起動時に復元）")
+    await ctx.send(embed=embed)
+
 
 @bot.command(name="sync")
 async def cmd_sync(ctx: commands.Context):
@@ -1719,10 +1989,11 @@ async def cmd_help(ctx: commands.Context):
             ("!docker logs <名前>",          "ログを表示"),
         ]),
         ("ログ・監視", [
-            ("!log <パス> [行数]",     "末尾N行を送信"),
-            ("!watch / !unwatch <パス>", "リアルタイム監視（複数ファイル同時OK）"),
-            ("!iwatch / !iunwatch <パス>", "ファイル変更を通知（inotify）"),
-            ("!alert <cpu|mem|disk> <%>", "しきい値アラートを設定"),
+            ("!log <パス> [行数]",          "末尾N行を送信"),
+            ("!watch / !unwatch <パス>",    "リアルタイム監視（複数ファイル同時OK）"),
+            ("!autowatch add/remove/list",  "起動時に自動再開する監視を管理"),
+            ("!iwatch / !iunwatch <パス>",  "ファイル変更を通知（inotify）"),
+            ("!alert <cpu|mem|disk> <%>",   "しきい値アラートを設定"),
         ]),
         ("画面・カメラ", [
             ("!ss",              "画面全体のスクリーンショット"),
@@ -1743,6 +2014,13 @@ async def cmd_help(ctx: commands.Context):
             ("!click <x> <y> [btn]", "マウスクリック（xdotool）"),
             ("!type <テキスト>",     "テキスト入力（xdotool）"),
             ("!key <キー>",          "キー送信（例: ctrl+c, Return）"),
+        ]),
+        ("永続設定", [
+            ("!settings",                       "全永続設定を一覧表示（再起動後も保持）"),
+            ("!block list/add/remove <cmd>",    "ブロックコマンドを動的管理"),
+            ("!autowatch list/add/remove <path>","ログ自動監視を管理（起動時に復元）"),
+            ("!autoshot [秒] / !stopauto",       "自動スクショ（設定は再起動後も復元）"),
+            ("!alert / !unalert",                "アラート（設定は再起動後も復元）"),
         ]),
         ("スラッシュコマンド", [
             ("/run /sysinfo /screenshot /ps /log", "主要コマンドのスラッシュ版"),
