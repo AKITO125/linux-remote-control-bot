@@ -1,7 +1,7 @@
 # Discord Linux Remote Control Bot
 
 Discord から Linux PC をリモートコントロールするためのBotです。  
-コマンド実行・ファイル管理・スクリーンショット・電源操作・デュアルブートなど多機能を備えています。
+コマンド実行・ファイル管理・スクリーンショット・電源操作・デュアルブート・定期実行など多機能を備えています。
 
 ---
 
@@ -21,6 +21,7 @@ Discord から Linux PC をリモートコントロールするためのBotで�
 | ウィンドウ管理 | 一覧・フォーカス・個別クローズ（wmctrl） |
 | 入力操作 | マウスクリック・テキスト入力・キー送信（xdotool） |
 | クリップボード | 取得・設定 |
+| **永続設定・自動化** | **起動時コマンド・定期実行(cron)・自動監視・アラート（再起動後も復元）** |
 | スラッシュコマンド | `/run` `/sysinfo` `/screenshot` `/ps` `/log` |
 
 ---
@@ -58,8 +59,8 @@ Discord から Linux PC をリモートコントロールするためのBotで�
 ### 2. リポジトリをクローン
 
 ```bash
-git clone https://github.com/<あなたのユーザー名>/discord-linux-bot.git
-cd discord-linux-bot
+git clone https://github.com/AKITO125/linux-remote-control-bot.git
+cd linux-remote-control-bot
 ```
 
 ---
@@ -314,16 +315,21 @@ cd・export などの状態が引き継がれる永続シェルセッション�
 | `!watch <パス>` | ログをリアルタイム監視 |
 | `!unwatch <パス>` | 監視を停止 |
 | `!watches` | 監視中のファイル一覧 |
+| `!autowatch add <パス>` | 起動時に自動再開する監視を登録（即監視開始） |
+| `!autowatch remove <パス>` | 自動監視の登録を削除 |
+| `!autowatch list` | 自動監視の登録一覧（▶=監視中 ⏹=停止中） |
 | `!iwatch <パス>` | ファイル変更をinotifyで通知 |
 | `!iunwatch <パス>` | inotify監視を停止 |
-| `!alert <cpu\|mem\|disk> <%>` | しきい値アラートを設定 |
+| `!alert <cpu\|mem\|disk> <%>` | しきい値アラートを設定（再起動後も保持） |
 | `!alerts` | アラート設定一覧 |
 | `!unalert <cpu\|mem\|disk>` | アラートを解除 |
 
 ```
 !log /var/log/syslog 100
 !watch /var/log/nginx/access.log
+!autowatch add /var/log/syslog   # 次回起動時も自動で監視再開
 !alert cpu 90
+!alert mem 85
 !iwatch /home/user/downloads
 ```
 
@@ -336,7 +342,7 @@ cd・export などの状態が引き継がれる永続シェルセッション�
 | `!ss` / `!screenshot` | 画面全体のスクリーンショット |
 | `!ss window` | フォーカス中のウィンドウ |
 | `!ss <アプリ名>` | アプリ名でウィンドウを指定 |
-| `!autoshot [秒]` | 定期的にスクリーンショットを自動送信 |
+| `!autoshot [秒]` | 定期的にスクリーンショットを自動送信（再起動後も保持） |
 | `!stopauto` | 自動送信を停止 |
 | `!camera [デバイス]` | Webカメラで撮影して送信 |
 
@@ -393,12 +399,115 @@ xdotool が必要です（`sudo apt install xdotool`）。
 
 ---
 
+### 永続設定・自動化
+
+設定はすべて `config.json` に保存され、**Bot再起動後も自動的に復元**されます。  
+Bot起動時に、設定のあるチャンネルへ現在の設定一覧が embed で通知されます。
+
+#### 起動時コマンド (`!startup`)
+
+Bot が起動するたびに自動でシェルコマンドを実行し、結果をDiscordに送信します。
+
+| コマンド | 説明 |
+|---|---|
+| `!startup list` | 登録済みの起動時コマンド一覧 |
+| `!startup add <cmd>` | 起動時コマンドを追加 |
+| `!startup remove <番号>` | 指定番号のコマンドを削除 |
+| `!startup run` | 今すぐ全コマンドを手動実行 |
+
+```
+!startup add df -h                   # 起動時にディスク使用量を通知
+!startup add systemctl status nginx  # Nginxの状態を通知
+!startup list
+!startup remove 1
+!startup run   # 手動実行
+```
+
+#### 定期実行 (`!cron`)
+
+任意のシェルコマンドをN秒ごとに繰り返し実行し、結果をDiscordに送信します。  
+Bot再起動後も自動的に再開されます。
+
+| コマンド | 説明 |
+|---|---|
+| `!cron list` | cronジョブ一覧（▶=実行中 ⏹=停止中） |
+| `!cron add <秒> <cmd>` | N秒ごとに実行するジョブを追加 |
+| `!cron stop <id>` | ジョブを一時停止（設定は保持） |
+| `!cron start <id>` | 停止中のジョブを再開 |
+| `!cron remove <id>` | ジョブを削除（設定も削除） |
+
+```
+!cron add 300 df -h                        # 5分ごとにディスク確認
+!cron add 60 ps aux --sort=-%cpu | head -5 # 1分ごとにCPU上位プロセス
+!cron add 3600 uptime                      # 1時間ごとに稼働時間
+!cron list
+!cron stop 1    # 一時停止
+!cron start 1   # 再開
+!cron remove 2  # 削除
+```
+
+#### 動的ブロックリスト (`!block`)
+
+`.env` の `BLOCKED_COMMANDS` に加え、Discord から動的にブロックコマンドを管理できます。
+
+| コマンド | 説明 |
+|---|---|
+| `!block list` | `.env` 設定 + 動的追加のブロックリストを表示 |
+| `!block add <cmd>` | コマンドをブロックに追加 |
+| `!block remove <cmd>` | 動的ブロックリストから削除 |
+
+```
+!block add curl evil.com
+!block list
+!block remove curl evil.com
+```
+
+#### 全設定の確認 (`!settings`)
+
+すべての永続設定を一覧表示します。各項目に ▶（動作中）/ ⏹（次回起動時に復元）が表示されます。
+
+```
+!settings   # または !config
+```
+
+---
+
 ### メタコマンド
 
 | コマンド | 説明 |
 |---|---|
 | `!cmds` | コマンド一覧をDiscordに表示 |
 | `!sync` | スラッシュコマンドをDiscordに同期（初回のみ実行） |
+
+---
+
+## Bot起動時の動作
+
+永続設定が存在するチャンネルへ、起動から数秒後に以下のような embed が送信されます：
+
+```
+🟢 Bot起動
+2026-05-15 10:30:01 — 以下の設定を復元しました
+
+🚀 起動時コマンド
+  `df -h`
+  `systemctl status nginx`
+
+⏰ cronジョブ
+  `#1` 300秒ごと — `df -h`
+  `#2` 60秒ごと  — `ps aux --sort=-%cpu | head -5`
+
+👁 自動ログ監視
+  `/var/log/syslog`
+
+📸 自動スクリーンショット
+  60秒ごと
+
+⚠️ アラート
+  CPU>90% / MEM>85%
+```
+
+その後、起動時コマンドの実行結果が順番に投稿されます。
 
 ---
 
@@ -418,10 +527,10 @@ xdotool が必要です（`sudo apt install xdotool`）。
 
 `.env` に自分のDiscordユーザーIDのみを設定することで、他のユーザーがコマンドを実行できないようになります。
 
-### BLOCKED_COMMANDS
+### BLOCKED_COMMANDS / `!block`
 
-`.env` で危険なコマンドをブロックできます。  
-先頭一致でチェックされます。
+`.env` の `BLOCKED_COMMANDS` で静的にブロック、`!block add` で動的に追加できます。  
+どちらも先頭一致でチェックされます。`!startup` や `!cron` で登録するコマンドも同じブロックチェックが適用されます。
 
 ---
 
@@ -493,8 +602,8 @@ After=network.target
 
 [Service]
 User=youruser
-WorkingDirectory=/home/youruser/discord-linux-bot
-ExecStart=/usr/bin/python3 /home/youruser/discord-linux-bot/bot.py
+WorkingDirectory=/home/youruser/linux-remote-control-bot
+ExecStart=/usr/bin/python3 /home/youruser/linux-remote-control-bot/bot.py
 Restart=always
 RestartSec=5
 
@@ -508,6 +617,8 @@ sudo systemctl enable discord-bot
 sudo systemctl start discord-bot
 sudo systemctl status discord-bot
 ```
+
+systemd で常時起動にすると、`!startup` や `!cron` の設定がサーバー再起動後も自動で復元されます。
 
 ---
 
