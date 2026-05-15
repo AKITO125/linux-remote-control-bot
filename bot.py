@@ -383,64 +383,139 @@ async def _alert_monitor_loop():
             print(f"[alert] {e}")
 
 
+async def _send_startup_summary(channel: discord.abc.Messageable, ch_id: int) -> None:
+    """チャンネルに対して、そのチャンネルの永続設定一覧を embed で送信する。"""
+    ch_str = str(ch_id)
+    embed = discord.Embed(
+        title="🟢 Bot起動",
+        description=f"`{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}` — 以下の設定を復元しました",
+        color=discord.Color.green(),
+    )
+    has_any = False
+
+    # 起動時コマンド
+    s_cmds = [e["cmd"] for e in _cfg.get("startup", []) if e["ch"] == ch_str]
+    if s_cmds:
+        embed.add_field(
+            name="🚀 起動時コマンド",
+            value="\n".join(f"`{c}`" for c in s_cmds),
+            inline=False,
+        )
+        has_any = True
+
+    # cronジョブ
+    crons = [e for e in _cfg.get("cron", []) if e["ch"] == ch_str]
+    if crons:
+        embed.add_field(
+            name="⏰ cronジョブ",
+            value="\n".join(
+                f"`#{e['id']}` {e['interval']}秒ごと — `{e['cmd']}`" for e in crons
+            ),
+            inline=False,
+        )
+        has_any = True
+
+    # 自動ログ監視
+    watches = _cfg.get("autowatch", {}).get(ch_str, [])
+    if watches:
+        embed.add_field(
+            name="👁 自動ログ監視",
+            value="\n".join(f"`{p}`" for p in watches),
+            inline=False,
+        )
+        has_any = True
+
+    # 自動スクリーンショット
+    shot_interval = _cfg.get("autoshot", {}).get(ch_str)
+    if shot_interval:
+        embed.add_field(
+            name="📸 自動スクリーンショット",
+            value=f"{shot_interval}秒ごと",
+            inline=False,
+        )
+        has_any = True
+
+    # アラート
+    alert_th = _cfg.get("alerts", {}).get(ch_str)
+    if alert_th:
+        embed.add_field(
+            name="⚠️ アラート",
+            value=" / ".join(f"{k.upper()}>{v}%" for k, v in alert_th.items()),
+            inline=False,
+        )
+        has_any = True
+
+    if has_any:
+        await channel.send(embed=embed)
+
+
 async def _restore_persistent() -> None:
-    """Bot起動時に永続設定（startup / cron / autowatch / autoshot）を復元する。"""
+    """Bot起動時に永続設定を復元し、各チャンネルにサマリーを送信する。"""
     global _next_cron_id
     await asyncio.sleep(3)  # チャンネルキャッシュが揃うのを待つ
 
-    # 起動時コマンドを実行
-    for entry in _cfg.get("startup", []):
-        channel = bot.get_channel(int(entry["ch"]))
-        if not channel:
-            continue
-        cmd = entry["cmd"]
-        out = await run_shell(cmd)
-        ts = datetime.now().strftime("%H:%M:%S")
-        await channel.send(f"`{ts}` 🚀 **startup** — `{cmd}`")
-        if out:
-            await send_text(channel, out)
+    # 永続設定を持つ全チャンネルを収集
+    all_ch_ids: set[int] = set()
+    for e in _cfg.get("startup", []):
+        all_ch_ids.add(int(e["ch"]))
+    for e in _cfg.get("cron", []):
+        all_ch_ids.add(int(e["ch"]))
+    for s in (_cfg.get("autowatch", {}), _cfg.get("autoshot", {}), _cfg.get("alerts", {})):
+        for k in s:
+            all_ch_ids.add(int(k))
 
-    # cronジョブを再開
+    # 各チャンネルへ起動サマリーを送信
+    for ch_id in all_ch_ids:
+        ch = bot.get_channel(ch_id)
+        if ch:
+            await _send_startup_summary(ch, ch_id)
+
+    # cronジョブを再開（サマリー送信後）
     cron_ids = [e["id"] for e in _cfg.get("cron", [])]
     _next_cron_id = max(cron_ids, default=0) + 1
     for entry in _cfg.get("cron", []):
         cron_id = entry["id"]
-        channel = bot.get_channel(int(entry["ch"]))
-        if not channel:
+        ch = bot.get_channel(int(entry["ch"]))
+        if not ch:
             continue
         _cron_jobs[cron_id] = {
             "cmd": entry["cmd"], "interval": entry["interval"],
             "ch_id": int(entry["ch"]), "task": None,
         }
-        _start_cron_task(channel, cron_id, entry["cmd"], entry["interval"], run_now=True)
-        await channel.send(
-            f"🔄 **cron #{cron_id}** を再開 — `{entry['cmd']}` / {entry['interval']}秒ごと"
-        )
+        _start_cron_task(ch, cron_id, entry["cmd"], entry["interval"], run_now=True)
 
     # 自動ログ監視を再開
     for ch_id_str, paths in _cfg.get("autowatch", {}).items():
         ch_id = int(ch_id_str)
-        channel = bot.get_channel(ch_id)
-        if not channel:
+        ch = bot.get_channel(ch_id)
+        if not ch:
             continue
         for path_str in list(paths):
             target = Path(path_str)
             if not target.is_file():
                 continue
             key = (ch_id, path_str)
-            if key in _watchers:
-                continue
-            _start_watch_task(channel, target, key)
-            await channel.send(f"🔄 自動ログ監視を再開: `{path_str}`")
+            if key not in _watchers:
+                _start_watch_task(ch, target, key)
 
     # 自動スクリーンショットを再開
     for ch_id_str, interval in _cfg.get("autoshot", {}).items():
         ch_id = int(ch_id_str)
-        channel = bot.get_channel(ch_id)
-        if not channel or ch_id in _autoshoot:
+        ch = bot.get_channel(ch_id)
+        if not ch or ch_id in _autoshoot:
             continue
-        _start_autoshot_task(channel, interval)
-        await channel.send(f"🔄 自動スクリーンショットを再開（{interval}秒ごと）")
+        _start_autoshot_task(ch, interval)
+
+    # 起動時コマンドを実行して結果を送信
+    for entry in _cfg.get("startup", []):
+        ch = bot.get_channel(int(entry["ch"]))
+        if not ch:
+            continue
+        out = await run_shell(entry["cmd"])
+        ts = datetime.now().strftime("%H:%M:%S")
+        await ch.send(f"`{ts}` 🚀 **startup** — `{entry['cmd']}`")
+        if out:
+            await send_text(ch, out)
 
 
 # ════════════════════════════════════════════════════════════
